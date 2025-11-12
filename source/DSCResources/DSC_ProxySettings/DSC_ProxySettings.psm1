@@ -1,11 +1,14 @@
-$modulePath = Join-Path -Path (Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent) -ChildPath 'Modules'
+$modulePath = 'C:\Program Files\WindowsPowerShell\Modules\NetworkingDsc\9.0.0\Modules' #Join-Path -Path (Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent) -ChildPath 'Modules'
 
 # Import the Networking Common Modules
-Import-Module -Name (Join-Path -Path $modulePath -ChildPath 'NetworkingDsc.Common')
+Import-Module -Name (Join-Path -Path $modulePath `
+        -ChildPath (Join-Path -Path 'NetworkingDsc.Common' `
+            -ChildPath 'NetworkingDsc.Common.psm1'))
+
 Import-Module -Name (Join-Path -Path $modulePath -ChildPath 'DscResource.Common')
 
 # Import Localization Strings
-$script:localizedData = Get-LocalizedData -DefaultUICulture 'en-US'
+#$script:localizedData = Get-LocalizedData -BaseDirectory 'C:\Program Files\WindowsPowerShell\Modules\NetworkingDsc\9.0.0\' -DefaultUICulture 'en-US'
 
 <#
     .SYNOPSIS
@@ -30,8 +33,7 @@ function Get-TargetResource
             $($script:localizedData.GettingProxySettingsMessage -f $Target)
         ) -join '')
 
-    $proxySettingsPath = Get-ProxySettingsRegistryKeyPath `
-        -Target $Target
+    $proxySettingsPath = Get-ProxySettingsRegistryKeyPath -Target $Target
     $returnValue = @{
         Target = $Target
     }
@@ -41,38 +43,31 @@ function Get-TargetResource
         -Path $proxySettingsPath `
         -ErrorAction SilentlyContinue
 
-    $proxySettingsRegistryBinary = $null
+    $proxySettings = @{
+        Ensure = 'Absent'
+        Target = $Target
+    }
 
     if ($connectionsRegistryValues.DefaultConnectionSettings)
     {
-        $proxySettingsRegistryBinary = $connectionsRegistryValues.DefaultConnectionSettings
+        $proxySettings.DefaultConnectionSettings = $connectionsRegistryValues.DefaultConnectionSettings
+        $proxySettings.DefaultConnectionSettings = ConvertFrom-ProxySettingsBinary -ProxySettings $proxySettings.DefaultConnectionSettings
+        $proxySettings.Ensure = 'Present'
     }
-    elseif ($connectionsRegistryValues.SavedLegacySettings)
+    if ($connectionsRegistryValues.SavedLegacySettings)
     {
-        $proxySettingsRegistryBinary = $connectionsRegistryValues.SavedLegacySettings
+        $proxySettings.SavedLegacySettings = $connectionsRegistryValues.SavedLegacySettings
+        $proxySettings.SavedLegacySettings = ConvertFrom-ProxySettingsBinary -ProxySettings $proxySettings.SavedLegacySettings
+        $proxySettings.Ensure = 'Present'
     }
-
-    if ($proxySettingsRegistryBinary)
+    if ($connectionsRegistryValues.WinHttpSettings)
     {
-        $returnValue.Add('Ensure', 'Present')
-
-        $proxySettings = ConvertFrom-ProxySettingsBinary `
-            -ProxySettings $proxySettingsRegistryBinary
-
-        $returnValue.Add('EnableManualProxy', $proxySettings.EnableManualProxy)
-        $returnValue.Add('EnableAutoConfiguration', $proxySettings.EnableAutoConfiguration)
-        $returnValue.Add('EnableAutoDetection', $proxySettings.EnableAutoDetection)
-        $returnValue.Add('ProxyServer', $proxySettings.ProxyServer)
-        $returnValue.Add('ProxyServerBypassLocal', $proxySettings.ProxyServerBypassLocal)
-        $returnValue.Add('ProxyServerExceptions', $proxySettings.ProxyServerExceptions)
-        $returnValue.Add('AutoConfigURL', $proxySettings.AutoConfigURL)
-    }
-    else
-    {
-        $returnValue.Add('Ensure', 'Absent')
+        $proxySettings.WinHttpSettings = $connectionsRegistryValues.WinHttpSettings
+        $proxySettings.WinHttpSettings = ConvertFrom-ProxySettingsBinary -ProxySettings $proxySettings.WinHttpSettings
+        $proxySettings.Ensure = 'Present'
     }
 
-    return $returnValue
+    return $proxySettings
 }
 
 <#
@@ -135,7 +130,7 @@ function Set-TargetResource
         $Ensure = 'Present',
 
         [Parameter()]
-        [ValidateSet('All', 'Default', 'Legacy')]
+        [ValidateSet('All', 'Default', 'Legacy', 'WinHttp')]
         [System.String]
         $ConnectionType = 'All',
 
@@ -197,6 +192,14 @@ function Set-TargetResource
                 -Name 'SavedLegacySettings' `
                 -ErrorAction SilentlyContinue
         }
+
+        if ($ConnectionType -in ('All', 'WinHttp'))
+        {
+            Remove-ItemProperty `
+                -Path $proxySettingsPath `
+                -Name 'WinHttpSettings' `
+                -ErrorAction SilentlyContinue
+        }
     }
     else
     {
@@ -234,6 +237,18 @@ function Set-TargetResource
             Set-BinaryRegistryValue `
                 -Path $proxySettingsPath `
                 -Name 'SavedLegacySettings' `
+                -Value $proxySettings
+        }
+
+        if ($ConnectionType -in ('All', 'WinHttp'))
+        {
+            Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
+                    $($script:localizedData.WritingProxyBinarySettingsMessage -f $Target, 'WinHttpSettings', ($proxySettings -join ','))
+                ) -join '')
+
+            Set-BinaryRegistryValue `
+                -Path $proxySettingsPath `
+                -Name 'WinHttpSettings' `
                 -Value $proxySettings
         }
     }
@@ -300,7 +315,7 @@ function Test-TargetResource
         $Ensure = 'Present',
 
         [Parameter()]
-        [ValidateSet('All', 'Default', 'Legacy')]
+        [ValidateSet('All', 'Default', 'Legacy', 'WinHttp')]
         [System.String]
         $ConnectionType = 'All',
 
@@ -333,29 +348,51 @@ function Test-TargetResource
         $ProxyServerBypassLocal = $false
     )
 
+    $currentState = Get-TargetResource -Target $Target
+    $desiredState = @{
+        Target = $Target
+        Ensure = $Ensure
+    }
+
+    if ($ConnectionType -eq 'All' -or $ConnectionType -eq 'Legacy')
+    {
+        $desiredState.SavedLegacySettings = [hashtable]$PSBoundParameters
+        $desiredState.SavedLegacySettings.Remove('Target')
+        $desiredState.SavedLegacySettings.Remove('Ensure')
+    }
+
+    if ($ConnectionType -eq 'All' -or $ConnectionType -eq 'Default')
+    {
+        $desiredState.DefaultConnectionSettings = [hashtable]$PSBoundParameters
+        $desiredState.DefaultConnectionSettings.Remove('Target')
+        $desiredState.DefaultConnectionSettings.Remove('Ensure')
+    }
+
+    if ($ConnectionType -eq 'All' -or $ConnectionType -eq 'WinHttp')
+    {
+        $desiredState.WinHttpSettings = [hashtable]$PSBoundParameters
+        $desiredState.WinHttpSettings.Remove('Target')
+        $desiredState.WinHttpSettings.Remove('Ensure')
+    }
+
+
     Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
             $($script:localizedData.CheckingProxySettingsMessage -f $Target, $Ensure)
         ) -join '')
 
-    $desiredConfigurationMatch = $true
-    $proxySettingsPath = Get-ProxySettingsRegistryKeyPath `
-        -Target $Target
-
-    # Get the registry values in the Connections registry key
-    $connectionsRegistryValues = Get-ItemProperty `
-        -Path $proxySettingsPath `
-        -ErrorAction SilentlyContinue
-
+    $result = Compare-DscParameterState -CurrentValues $currentState -DesiredValues $desiredState -SortArrayValues -Verbose:$PSBoundParameters.Verbose
+    return -not $result
+    <#
     if ($Ensure -eq 'Absent')
     {
         # Check if any of the Proxy Settings need to be removed
-        if ($ConnectionType -in ('All', 'Default'))
+        if ($ConnectionType -in ('All','Default'))
         {
             # Does the Default Connection Settings need to be removed?
             if ($connectionsRegistryValues.DefaultConnectionSettings)
             {
                 Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
-                        $($script:localizedData.ProxyBinarySettingsRequiresRemovalMessage -f $Target, 'DefaultConnectionSettings')
+                    $($script:localizedData.ProxyBinarySettingsRequiresRemovalMessage -f $Target, 'DefaultConnectionSettings')
                     ) -join '')
 
                 $desiredConfigurationMatch = $false
@@ -363,12 +400,12 @@ function Test-TargetResource
         }
 
         # Does the Saved Legacy Settings need to be removed?
-        if ($ConnectionType -in ('All', 'Legacy'))
+        if ($ConnectionType -in ('All','Legacy'))
         {
             if ($connectionsRegistryValues.SavedLegacySettings)
             {
                 Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
-                        $($script:localizedData.ProxyBinarySettingsRequiresRemovalMessage -f $Target, 'SavedLegacySettings')
+                    $($script:localizedData.ProxyBinarySettingsRequiresRemovalMessage -f $Target, 'SavedLegacySettings')
                     ) -join '')
 
                 $desiredConfigurationMatch = $false
@@ -383,11 +420,11 @@ function Test-TargetResource
         $desiredValues.Remove('Ensure')
         $desiredValues.Remove('ConnectionType')
 
-        if ($ConnectionType -in ('All', 'Default'))
+        if ($ConnectionType -in ('All','Default'))
         {
             # Check if the Default Connection proxy settings are in the desired state
             Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
-                    $($script:localizedData.CheckingProxyBinarySettingsMessage -f $Target, 'DefaultConnectionSettings')
+                $($script:localizedData.CheckingProxyBinarySettingsMessage -f $Target, 'DefaultConnectionSettings')
                 ) -join '')
 
             if ($connectionsRegistryValues.DefaultConnectionSettings)
@@ -407,18 +444,18 @@ function Test-TargetResource
             if (-not $inDesiredState)
             {
                 Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
-                        $($script:localizedData.ProxyBinarySettingsNoMatchMessage -f $Target, 'DefaultConnectionSettings')
+                    $($script:localizedData.ProxyBinarySettingsNoMatchMessage -f $Target, 'DefaultConnectionSettings')
                     ) -join '')
 
                 $desiredConfigurationMatch = $false
             }
         }
 
-        if ($ConnectionType -in ('All', 'Legacy'))
+        if ($ConnectionType -in ('All','Legacy'))
         {
             # Check if the Saved Legacy proxy settings are in the desired state
             Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
-                    $($script:localizedData.CheckingProxyBinarySettingsMessage -f $Target, 'SavedLegacySettings')
+                $($script:localizedData.CheckingProxyBinarySettingsMessage -f $Target, 'SavedLegacySettings')
                 ) -join '')
 
             if ($connectionsRegistryValues.SavedLegacySettings)
@@ -438,7 +475,7 @@ function Test-TargetResource
             if (-not $inDesiredState)
             {
                 Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
-                        $($script:localizedData.ProxyBinarySettingsNoMatchMessage -f $Target, 'SavedLegacySettings')
+                    $($script:localizedData.ProxyBinarySettingsNoMatchMessage -f $Target, 'SavedLegacySettings')
                     ) -join '')
 
                 $desiredConfigurationMatch = $false
@@ -447,6 +484,7 @@ function Test-TargetResource
     }
 
     return $desiredConfigurationMatch
+#>
 } # Test-TargetResource
 
 <#
@@ -826,12 +864,13 @@ function ConvertFrom-ProxySettingsBinary
             $null = [System.Buffer]::BlockCopy($ProxySettings, $stringPointer, $stringBytes, 0, $stringLength)
             $proxyServerExceptionsString = [System.Text.Encoding]::ASCII.GetString($stringBytes)
             $stringPointer += $stringLength
-            $proxyServerExceptions = [System.String[]] ($proxyServerExceptionsString -split ';')
+            $proxyServerExceptions = $proxyServerExceptionsString -split ';'
         }
 
         if ($proxyServerExceptions.Contains('<local>'))
         {
             $proxyServerExceptions = $proxyServerExceptions | Where-Object -FilterScript { $_ -ne '<local>' }
+            $proxyServerExceptions = [string[]]$proxyServerExceptions
             $proxyParameters.Add('ProxyServerBypassLocal', $true)
         }
         else
