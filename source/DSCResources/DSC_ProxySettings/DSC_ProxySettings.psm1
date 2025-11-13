@@ -1,14 +1,11 @@
-$modulePath = 'C:\Program Files\WindowsPowerShell\Modules\NetworkingDsc\9.0.0\Modules' #Join-Path -Path (Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent) -ChildPath 'Modules'
+$modulePath = 'C:\Program Files\WindowsPowerShell\Modules\NetworkingDsc\99.0.0\Modules' #Join-Path -Path (Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent) -ChildPath 'Modules'
 
 # Import the Networking Common Modules
-Import-Module -Name (Join-Path -Path $modulePath `
-        -ChildPath (Join-Path -Path 'NetworkingDsc.Common' `
-            -ChildPath 'NetworkingDsc.Common.psm1'))
-
+Import-Module -Name (Join-Path -Path $modulePath -ChildPath (Join-Path -Path 'NetworkingDsc.Common' -ChildPath 'NetworkingDsc.Common.psm1'))
 Import-Module -Name (Join-Path -Path $modulePath -ChildPath 'DscResource.Common')
 
 # Import Localization Strings
-#$script:localizedData = Get-LocalizedData -BaseDirectory 'C:\Program Files\WindowsPowerShell\Modules\NetworkingDsc\9.0.0\' -DefaultUICulture 'en-US'
+$script:localizedData = Get-LocalizedData -BaseDirectory 'C:\Program Files\WindowsPowerShell\Modules\NetworkingDsc\99.0.0\DSCResources\DSC_ProxySettings\en-US' -DefaultUICulture 'en-US' -FileName DSC_ProxySettings.strings.psd1
 
 <#
     .SYNOPSIS
@@ -214,13 +211,13 @@ function Set-TargetResource
         $convertToProxySettingsBinaryParameters.Remove('Ensure')
         $convertToProxySettingsBinaryParameters.Remove('ConnectionType')
 
-        $proxySettings = ConvertTo-ProxySettingsBinary @convertToProxySettingsBinaryParameters
-
         if ($ConnectionType -in ('All', 'Default'))
         {
             Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
                     $($script:localizedData.WritingProxyBinarySettingsMessage -f $Target, 'DefaultConnectionSettings', ($proxySettings -join ','))
                 ) -join '')
+
+            $proxySettings = ConvertTo-ProxySettingsBinary @convertToProxySettingsBinaryParameters -ConnectionType Default
 
             Set-BinaryRegistryValue `
                 -Path $proxySettingsPath `
@@ -234,6 +231,8 @@ function Set-TargetResource
                     $($script:localizedData.WritingProxyBinarySettingsMessage -f $Target, 'SavedLegacySettings', ($proxySettings -join ','))
                 ) -join '')
 
+            $proxySettings = ConvertTo-ProxySettingsBinary @convertToProxySettingsBinaryParameters -ConnectionType Legacy
+
             Set-BinaryRegistryValue `
                 -Path $proxySettingsPath `
                 -Name 'SavedLegacySettings' `
@@ -245,6 +244,8 @@ function Set-TargetResource
             Write-Verbose -Message ( @("$($MyInvocation.MyCommand): "
                     $($script:localizedData.WritingProxyBinarySettingsMessage -f $Target, 'WinHttpSettings', ($proxySettings -join ','))
                 ) -join '')
+
+            $proxySettings = ConvertTo-ProxySettingsBinary @convertToProxySettingsBinaryParameters -ConnectionType WinHttp
 
             Set-BinaryRegistryValue `
                 -Path $proxySettingsPath `
@@ -690,6 +691,11 @@ function ConvertTo-ProxySettingsBinary
     [OutputType([System.Byte[]])]
     param
     (
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Default', 'Legacy', 'WinHttp')]
+        [System.String]
+        $ConnectionType,
+
         [Parameter()]
         [System.Boolean]
         $EnableAutoDetection = $false,
@@ -719,7 +725,14 @@ function ConvertTo-ProxySettingsBinary
         $ProxyServerBypassLocal = $false
     )
 
-    [System.Byte[]] $proxySettings = @(0x46, 0x0, 0x0, 0x0, 0x8, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0)
+    [System.Byte[]]$proxySettings = if ($ConnectionType -in 'Default', 'Legacy')
+    {
+        @(0x46, 0x0, 0x0, 0x0, 0x8, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0)
+    }
+    else
+    {
+        @(0x28, 0x0, 0x0, 0x0, 0x8, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0)
+    }
 
     if ($EnableManualProxy)
     {
@@ -799,8 +812,34 @@ function ConvertFrom-ProxySettingsBinary
 
     if ($ProxySettings.Count -gt 0)
     {
+        <#
+        from https://stackoverflow.com/questions/4283027/whats-the-format-of-the-defaultconnectionsettings-value-in-the-windows-registry
+        0.  keep this value
+        1.  "00" placeholder
+        2.  "00" placeholder
+        3.  "00" placeholder
+        4.  "xx" increments if changed
+        5.  "xx" increments if 4. is "FF"
+        6.  "00" placeholder
+        7.  "00" placeholder
+        8.  "03"=enable proxy, enable auto detect settings, auto script etc
+        9.  "00" placeholder
+        10. "00" placeholder
+        11. "00" placeholder
+        12. "xx" length of "proxyserver:port"
+        13. "00" placeholder
+        14. "00" placeholder
+        15. "00" placeholder
+        "proxyserver:port"
+            "xx" length of proxy exception list
+            "00" placeholder
+            "00" placeholder
+            "00" placeholder
+        Proxy Exception list delimited by semi-colons (use "<local>" to exclude local addresses)
+        36 times "00"
+        #>
         # Do a smoke test on the binary to check it looks valid
-        if ($ProxySettings[0] -ne 0x46)
+        if ($ProxySettings[0] -ne 0x46 -and $ProxySettings[0] -ne 0x28)
         {
             New-InvalidOperationException `
                 -Message ($script:localizedData.ProxySettingsBinaryInvalidError -f $ProxySettings[0])
@@ -836,9 +875,7 @@ function ConvertFrom-ProxySettingsBinary
 
         # Extract the Proxy Server string
         $proxyServer = ''
-        $stringLength = Get-Int32FromByteArray `
-            -Byte $ProxySettings `
-            -StartByte $stringPointer
+        $stringLength = Get-Int32FromByteArray -Byte $ProxySettings -StartByte $stringPointer
         $stringPointer += 4
 
         if ($stringLength -gt 0)
